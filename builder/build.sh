@@ -1,41 +1,6 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-function sleep_before_exit {
-	# delay before exiting, so stdout/stderr flushes through the logging system
-	sleep 3
-}
-trap sleep_before_exit EXIT
-
-[[ $DEIS_DEBUG ]] && set -x
-unset DEIS_DEBUG
-
-app_dir=/app
-build_root=/tmp/build
-cache_root=/tmp/cache
-cache_file=/tmp/cache.tgz
-secret_dir=/tmp/env
-env_root=/tmp/environment
-buildpack_root=/tmp/buildpacks
-
-mkdir -p $app_dir
-mkdir -p $cache_root
-mkdir -p $env_root
-mkdir -p $secret_dir
-mkdir -p $buildpack_root
-mkdir -p $build_root/.profile.d
-
-if ! [[ -z "${TAR_PATH}" ]]; then
-	get_object
-	tar -xzf /tmp/slug.tgz -C /app/
-	unset TAR_PATH
-fi
-
-if [[ "$1" == "-" ]]; then
-    slug_file="$1"
-else
-    slug_file=/tmp/slug.tgz
-fi
 
 function output_redirect() {
     if [[ "$slug_file" == "-" ]]; then
@@ -63,22 +28,47 @@ function ensure_indent() {
     done
 }
 
-function cache_fingerprint() {
-  md5deep -r ${cache_root} | sort | uniq | md5sum
+function sleep_before_exit {
+	# delay before exiting, so stdout/stderr flushes through the logging system
+	sleep 3
 }
 
-# Restore cache when a $CACHE_PATH was supplied
-if ! [[ -z "${CACHE_PATH}" ]]; then
-  echo_title "Restoring cache..."
-  restore_cache
-  if [[ -f ${cache_file} ]]; then
-    tar -xzf ${cache_file} -C ${cache_root}
-    echo_normal "Done!"
-  else
-    echo_normal "No cache file found. If this is the first deploy, it will be created now."
-  fi
 
-  original_cache_fingerprint=$(cache_fingerprint)
+trap sleep_before_exit EXIT
+
+[[ $DEIS_DEBUG ]] && set -x
+unset DEIS_DEBUG
+
+app_dir=/app
+build_root=/tmp/build
+cache_root=/tmp/cache
+cache_file=/tmp/cache.tgz
+secret_dir=/tmp/env
+env_root=/tmp/environment
+buildpack_root=/tmp/buildpacks
+
+mkdir -p $app_dir
+mkdir -p $cache_root
+mkdir -p $env_root
+mkdir -p $secret_dir
+mkdir -p $buildpack_root
+mkdir -p $build_root/.profile.d
+
+if [[ "$1" == "-" ]]; then
+    slug_file="$1"
+else
+    slug_file=/tmp/slug.tgz
+fi
+
+## Load source from STDIN
+cat | tar -xzmC $app_dir
+
+# Restore cache when a $CACHE_PATH was supplied
+if [[ -f ${cache_file} ]]; then
+  tar -xzf ${cache_file} -C ${cache_root}
+  echo_normal "Done!"
+else
+  echo_normal "No cache file found. If this is the first deploy, it will be created now."
 fi
 
 ## Copy application code over
@@ -97,26 +87,7 @@ export APP_DIR="$app_dir"
 export HOME="$app_dir"
 REQUEST_ID=$(openssl rand -base64 32)
 export REQUEST_ID
-export STACK=cedar-14
-
-## copy the environment dir excluding the ephemeral ..data/ dir and other symlinks created by Kubernetes.
-
-if [ "$(ls -A $secret_dir)" ]; then
-   cp $secret_dir/* $env_root/
-fi
-
-## SSH key configuration
-
-if [[ -f "$env_root/SSH_KEY" ]]; then
-    mkdir -p ~/.ssh/
-    chmod 700 ~/.ssh/
-
-    base64 -d "$env_root/SSH_KEY" > ~/.ssh/id_rsa
-    chmod 400 ~/.ssh/id_rsa
-
-    echo 'StrictHostKeyChecking=no' > ~/.ssh/config
-    chmod 600 ~/.ssh/config
-fi
+export STACK=heroku-20
 
 ## Buildpack detection
 
@@ -205,15 +176,6 @@ fi
 # by slug.
 chown -R slug:slug $build_root/*
 
-
-## Produce slug
-
-if [[ -f "$build_root/.slugignore" ]]; then
-    tar -z --exclude='.git' -X "$build_root/.slugignore" -C $build_root -cf $slug_file . | cat
-else
-    tar -z --exclude='.git' -C $build_root -cf $slug_file . | cat
-fi
-
 if [[ ! -f "$build_root/Procfile" ]]; then
 	if [[ -s "$build_root/.release" ]] && [[ $default_types ]]; then
 		ruby -e "require 'yaml';procTypes = (YAML.load_file('$build_root/.release')['default_process_types']);open('$build_root/Procfile','w') {|f| YAML.dump(procTypes,f)}"
@@ -222,36 +184,30 @@ if [[ ! -f "$build_root/Procfile" ]]; then
 	fi
 fi
 
+## Produce slug
+
+if [[ -f "$build_root/.slugignore" ]]; then
+    tar -z --exclude='.git' -X "$build_root/.slugignore" -C $build_root -cf $slug_file .
+else
+    tar -z --exclude='.git' -C $build_root -cf $slug_file .
+fi
+
 # Compress and save cache
 if ! [[ -z "${CACHE_PATH}" ]]; then
   echo_title "Checking for changes inside the cache directory..."
   # If there's any files in the cache_root folder, we'll create a tar and upload
   # it for future use
   if [ "$(ls -A ${cache_root})" ]; then
-    # Let's check if the fingerprint changed, if it did, we'll be updating
-    # the cache
-    if [[ "$original_cache_fingerprint" != "$(cache_fingerprint)" ]]; then
-      echo_normal "Files inside cache folder changed, uploading new cache..."
-
-      # Create a new cache file and check if it requires to be updated
-      tar -z -C ${cache_root} -cf ${cache_file} .
-      cache_size=$(du -Sh "$cache_file" | cut -f1)
-
-      store_cache
-      echo_normal "Done: Uploaded cache (${cache_size})"
-    else
-      echo_normal "Cache unchanged, not updating"
-    fi
+    # Create a new cache file and check if it requires to be updated
+    tar -z -C ${cache_root} -cf ${cache_file} .
+    cache_size=$(du -Sh "$cache_file" | cut -f1)
+    echo_normal "Done: Created cache at ${cache_file} (${cache_size})"
   else
-    echo_normal "No files were added to the cache folder, cache wasn't updated"
+    echo_normal "No files were added to the cache folder. skipping"
   fi
 fi
 
 if [[ "$slug_file" != "-" ]]; then
     slug_size=$(du -Sh "$slug_file" | cut -f1)
     echo_title "Compiled slug size is $slug_size"
-
-    if [[ $PUT_PATH ]]; then
-			put_object
-		fi
 fi

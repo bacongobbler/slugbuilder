@@ -1,3 +1,0 @@
-org: "deisci"
-pull_policy: "Always"
-docker_tag: canary
